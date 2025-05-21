@@ -25,6 +25,14 @@ CLIENTS = {}  # { websocket: {"username": None, "session_key": None} }
 SERVER_PRIVATE_KEY = None
 SERVER_PUBLIC_KEY_PEM = None
 
+
+# UWAGA: TO JEST NIEBEZPIECZNE W PRODUKCJI! KLUCZ W KODZIE!
+# Klucz musi mieć 16, 24 lub 32 bajty. Wybierzmy 32 bajty (AES-256)
+# Możesz wygenerować losowe bajty raz i wkleić je tutaj, np. za pomocą:
+# import os; print(os.urandom(32))
+HARDCODED_MESSAGES_KEY = b'\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10\x01\x23\x45\x67\x89\xab\xcd\xef\xfe\xdc\xba\x98\x76\x54\x32\x10' # Przykładowy 32-bajtowy klucz
+MESSAGES_FILE_PATH = "messages_simple.dat"
+
 # --- Blokady dla dostępu do współdzielonych zasobów ---
 # Konieczne, bo CLI działa w innym wątku niż główna pętla asyncio
 users_lock = threading.Lock()
@@ -99,6 +107,62 @@ def decrypt_message_aes(session_key, encrypted_data_b64):
         logging.error(f"Błąd deszyfrowania AES lub weryfikacji: {e}")
         return None
 
+def encrypt_data_to_file_simple(filepath, data_obj, key):
+    """Szyfruje obiekt danych (JSON) za pomocą AES-GCM i stałego klucza."""
+    print(f"Zapisuję dane do pliku: {filepath}")
+    try:
+        json_data = json.dumps(data_obj).encode('utf-8')
+        aesgcm = AESGCM(key)
+        nonce = os.urandom(12) # Nonce MUSI być unikalny dla każdej operacji szyfrowania tym samym kluczem
+        ciphertext = aesgcm.encrypt(nonce, json_data, None) # Ostatni argument to associated_data
+
+        with open(filepath, "wb") as f:
+            f.write(nonce) # Zapisz nonce
+            f.write(ciphertext) # Ciphertext już zawiera tag uwierzytelniający
+        
+        # logging.debug(f"Pomyślnie zaszyfrowano (prosto) i zapisano dane do: {filepath}")
+        return True
+    except Exception as e:
+        logging.error(f"Błąd podczas prostego szyfrowania i zapisywania pliku {filepath}: {e}", exc_info=True)
+        return False
+
+def decrypt_data_from_file_simple(filepath, key):
+    """Deszyfruje dane z pliku (AES-GCM) używając stałego klucza."""
+    if not os.path.exists(filepath):
+        logging.info(f"Plik danych {filepath} nie istnieje.")
+        return None
+
+    try:
+        with open(filepath, "rb") as f:
+            nonce = f.read(12) # Odczytaj nonce
+            if len(nonce) != 12: # Sprawdzenie, czy odczytano wystarczająco dużo bajtów
+                logging.error(f"Niekompletny plik (nonce) {filepath}")
+                return None
+            ciphertext_with_tag = f.read()
+            if not ciphertext_with_tag: # Sprawdzenie, czy są dane do deszyfrowania
+                logging.error(f"Niekompletny plik (ciphertext) {filepath}")
+                return None
+
+
+        aesgcm = AESGCM(key)
+        try:
+            decrypted_json_data = aesgcm.decrypt(nonce, ciphertext_with_tag, None)
+        except Exception as e: # Np. InvalidTag, jeśli tag się nie zgadza (uszkodzenie, zły klucz)
+            logging.error(f"Nie udało się odszyfrować pliku {filepath}. Możliwe uszkodzenie lub zły klucz/nonce. Błąd: {e}")
+            return None
+
+        data_obj = json.loads(decrypted_json_data.decode('utf-8'))
+        # logging.debug(f"Pomyślnie odszyfrowano (prosto) i wczytano dane z: {filepath}")
+        return data_obj
+    except FileNotFoundError: # Już obsłużone wyżej, ale dla pewności
+        logging.info(f"Plik {filepath} nie znaleziony.")
+        return None
+    except json.JSONDecodeError as e:
+        logging.error(f"Błąd dekodowania JSON z pliku {filepath} po deszyfracji: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Błąd podczas prostego deszyfrowania i wczytywania pliku {filepath}: {e}", exc_info=True)
+        return None
 
 # --- Funkcje Pomocnicze ---
 
@@ -134,6 +198,45 @@ async def broadcast(message_type, payload, exclude_websocket=None):
         if tasks:
             await asyncio.gather(*tasks)  # Czekamy na zakończenie wszystkich zadań wysyłania
 
+def load_messages_from_file():
+    """Wczytuje i deszyfruje wiadomości z pliku do pamięci (proste szyfrowanie)."""
+    global MESSAGES, MESSAGE_COUNTER
+    
+    # Używamy stałego klucza
+    loaded_messages = decrypt_data_from_file_simple(MESSAGES_FILE_PATH, HARDCODED_MESSAGES_KEY)
+    
+    if loaded_messages is not None and isinstance(loaded_messages, list):
+        with messages_lock:
+            MESSAGES = loaded_messages
+            if MESSAGES:
+                try:
+                    MESSAGE_COUNTER = MESSAGES[-1].get('id', 0)
+                except (IndexError, TypeError):
+                    MESSAGE_COUNTER = 0
+            else:
+                MESSAGE_COUNTER = 0
+            logging.info(f"Wczytano (prosto) {len(MESSAGES)} wiadomości z pliku. Ostatnie ID: {MESSAGE_COUNTER}")
+    elif loaded_messages is None and not os.path.exists(MESSAGES_FILE_PATH):
+        logging.info(f"Plik {MESSAGES_FILE_PATH} nie istnieje. Startuję z pustą listą wiadomości.")
+        MESSAGES = []
+        MESSAGE_COUNTER = 0
+    else:
+        logging.warning(f"Nie udało się wczytać wiadomości z {MESSAGES_FILE_PATH} lub plik jest uszkodzony/pusty. Startuję z pustą listą wiadomości.")
+        MESSAGES = []
+        MESSAGE_COUNTER = 0
+
+def save_messages_to_file():
+    """Szyfruje i zapisuje aktualny stan wiadomości z pamięci do pliku (proste szyfrowanie)."""
+    with messages_lock:
+        print(f"Zapisuję {len(MESSAGES)} wiadomości do pliku: {MESSAGES_FILE_PATH}")
+        # Używamy stałego klucza
+        success = encrypt_data_to_file_simple(MESSAGES_FILE_PATH, MESSAGES, HARDCODED_MESSAGES_KEY)
+    
+    if success:
+        pass
+    else:
+        logging.error(f"Nie udało się zapisać wiadomości (prosto) do pliku {MESSAGES_FILE_PATH}")
+    return success
 
 # --- Obsługa Logiki Serwera ---
 
@@ -210,10 +313,13 @@ async def handle_chat_message(client_info, message_text):
             "flags": []
         }
         MESSAGES.append(message)
+
         # Rozsyłamy tylko payload wiadomości czatu
         await broadcast("chat_message", message)
         logging.info(f"Wiadomość od {username}: {message_text}")
-
+    
+    if not save_messages_to_file():
+        pass
 
 async def handle_get_history(client_info, count):
     username = client_info.get("username")
@@ -579,7 +685,9 @@ async def main(host, port, private_key_path):
     # Wczytaj hasło do klucza prywatnego
     key_password = getpass.getpass("Podaj hasło do klucza prywatnego serwera: ")
     if not load_server_keys(private_key_path, key_password):
-        return  # Zakończ, jeśli klucze się nie załadowały
+        return  # Zakończ, jeśli klucze się nie 
+        
+    load_messages_from_file() 
 
     # Uruchom CLI w osobnym wątku
     cli_thread = threading.Thread(target=cli_commands, daemon=True)

@@ -3,6 +3,7 @@ import json
 import asyncio
 import websockets
 import threading
+import socket
 import os
 import base64
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,6 +24,9 @@ class NetworkHandler(QThread):
     message_received = pyqtSignal(dict)  # Przekazuje odszyfrowany payload wiadomości
     login_result = pyqtSignal(bool, str)  # Sukces/porażka, wiadomość
 
+    session_and_public_key = pyqtSignal(str, str)  # Klucz sesji i klucz publiczny serwera
+    encrypted_message = pyqtSignal(str)  # Zaszyfrowana wiadomość
+
     def __init__(self, server_uri):
         super().__init__()
         self.server_uri = server_uri
@@ -38,7 +42,9 @@ class NetworkHandler(QThread):
     # --- Funkcje Kryptograficzne Klienta ---
     def _generate_session_key(self):
         self.session_key = AESGCM.generate_key(bit_length=256)
-
+        #self.session_and_public_key.emit(None, base64.b64encode(self.session_key).decode('utf-8')) 
+        self.session_and_public_key.emit(None, base64.b64encode(self.session_key).decode('utf-8')) 
+        
     def _encrypt_session_key(self):
         if not self.server_public_key or not self.session_key:
             return None
@@ -95,6 +101,12 @@ class NetworkHandler(QThread):
     async def connect_and_listen(self):
         self.connection_status.emit("Connecting")
         try:
+            #======Własny port klienta===========
+            # local_port = 65000  # Wybierz dostępny port zgodny z polityką VPS
+            # sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # sock.bind(("0.0.0.0", local_port))  # Ustawienie portu klienta
+            # sock.connect(("localhost", 8765))
+            # async with websockets.connect(self.server_uri, sock=sock) as ws:
             async with websockets.connect(self.server_uri) as ws:
                 self.websocket = ws
                 self.connection_status.emit("Connected - Key Exchange")
@@ -106,6 +118,7 @@ class NetworkHandler(QThread):
 
                 if response.get("type") == "public_key":
                     pem_public = response.get("key").encode('utf-8')
+                    self.session_and_public_key.emit(response.get("key"), None)  # Emituj klucz publiczny
                     try:
                         self.server_public_key = serialization.load_pem_public_key(
                             pem_public,
@@ -135,6 +148,7 @@ class NetworkHandler(QThread):
                                 decrypted_json = self.decrypt_message(encrypted_data)
                                 if decrypted_json:
                                     message = json.loads(decrypted_json)
+                                    message["encrypted"] = encrypted_data
                                     # Wyślij sygnał do GUI
                                     self.handle_server_message(message)
                                 else:
@@ -253,16 +267,19 @@ class ChatClientWindow(QMainWindow):
         self.connection_tab = QWidget()
         self.login_tab = QWidget()
         self.chat_tab = QWidget()
+        self.encrypted_data = QWidget()
 
         self.tab_widget.addTab(self.config_tab, "Konfiguracja")
         self.tab_widget.addTab(self.connection_tab, "Połączenie")
         self.tab_widget.addTab(self.login_tab, "Logowanie")
         self.tab_widget.addTab(self.chat_tab, "Czat")
+        self.tab_widget.addTab(self.encrypted_data, "Dane Szyfrowania")
 
         self.init_config_tab()
         self.init_connection_tab()
         self.init_login_tab()
         self.init_chat_tab()
+        self.init_encrypted_data_tab()
 
         self.update_ui_state("Disconnected")  # Początkowy stan
 
@@ -374,6 +391,25 @@ class ChatClientWindow(QMainWindow):
         layout.addLayout(top_layout)
         layout.addLayout(bottom_layout)
 
+    # Zakładka zawiera trzy pola tekstowe tylko do odczytu: obecny klucz sesji, klucz publiczny serwera i zaszyfrowana wiadomość
+    def init_encrypted_data_tab(self):
+        layout = QVBoxLayout(self.encrypted_data)
+        self.session_key_display = QTextEdit()
+        self.session_key_display.setReadOnly(True)
+        self.server_public_key_display = QTextEdit()
+        self.server_public_key_display.setReadOnly(True)
+        self.encrypted_message_display = QTextEdit()
+        self.encrypted_message_display.setReadOnly(True)
+
+        layout.addWidget(QLabel("Obecny klucz sesji:"))
+        layout.addWidget(self.session_key_display)
+        layout.addWidget(QLabel("Klucz publiczny serwera:"))
+        layout.addWidget(self.server_public_key_display)
+        layout.addWidget(QLabel("Zaszyfrowana wiadomość:"))
+        layout.addWidget(self.encrypted_message_display)
+
+
+
     # --- Akcje GUI ---
 
     def save_config_action(self):
@@ -403,6 +439,7 @@ class ChatClientWindow(QMainWindow):
         self.network_thread.connection_status.connect(self.handle_connection_status)
         self.network_thread.message_received.connect(self.handle_message_received)
         self.network_thread.login_result.connect(self.handle_login_result)
+        self.network_thread.session_and_public_key.connect(self.handle_session_and_public_key)
         self.network_thread.finished.connect(self.network_thread_finished)  # Sprzątanie po zakończeniu wątku
 
         self.network_thread.start()
@@ -472,6 +509,10 @@ class ChatClientWindow(QMainWindow):
         msg_type = message.get("type")
         payload = message.get("payload", {})
 
+        #wyswietl zaszyfrowaną wiadomość
+        if message.get("encrypted"):
+            self.encrypted_message_display.setPlainText(message.get("encrypted"))
+
         if msg_type == "chat_message":
             author = payload.get("author", "Unknown")
             text = payload.get("text", "")
@@ -501,6 +542,11 @@ class ChatClientWindow(QMainWindow):
             status = payload.get("status", "unknown")
             self.append_chat_message("[System]", f"Użytkownik {username} jest teraz {status}.")
 
+    def handle_session_and_public_key(self, public_key, session_key):
+        if public_key:
+            self.server_public_key_display.setPlainText(public_key)
+        if session_key:
+            self.session_key_display.setPlainText(session_key)
 
     def append_chat_message(self, prefix, message):
         # Dodaje wiadomość do QTextEdit, przewijając na dół
